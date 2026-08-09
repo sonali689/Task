@@ -13,8 +13,10 @@ from app.models import (
     ReconciliationReport,
 )
 from app.narrative import (
+    _build_grounding_values,
     _build_prompt,
     _build_traced_figures,
+    _find_ungrounded_numbers,
     _generate_fallback_narrative,
     _format_rupees,
 )
@@ -22,20 +24,24 @@ from app.narrative import (
 
 @pytest.fixture
 def sample_reconciliation():
+    # Figures match the actual Jul 27 sample data run through the fixed
+    # reconciliation.py: total_billed is net of discount, so outstanding
+    # is ₹18 (1800 paise) and pending_visits is 3 — see test_reconciliation.py.
     return ReconciliationReport(
         clinic_id="CLN-KNP-014",
         date="2026-07-27",
-        total_billed_paise=326000,
+        total_billed_paise=319000,
         total_collected_paise=317200,
-        outstanding_paise=8800,
+        total_discounts_paise=7000,
+        outstanding_paise=1800,
         total_refunds_paise=0,
         total_visits=18,
         refund_count=0,
         pending_visits=3,
         payment_mode_breakdown=[
-            PaymentModeBreakdown(mode="cash", billed_paise=129000, collected_paise=127000, outstanding_paise=2000),
-            PaymentModeBreakdown(mode="card", billed_paise=107000, collected_paise=79700, outstanding_paise=27300),
-            PaymentModeBreakdown(mode="upi", billed_paise=90000, collected_paise=110500, outstanding_paise=-20500),
+            PaymentModeBreakdown(mode="cash", billed_paise=127500, collected_paise=127000, outstanding_paise=500),
+            PaymentModeBreakdown(mode="card", billed_paise=83500, collected_paise=82700, outstanding_paise=800),
+            PaymentModeBreakdown(mode="upi", billed_paise=108000, collected_paise=107500, outstanding_paise=500),
         ],
         validation_errors=[],
     )
@@ -96,13 +102,13 @@ class TestTracedFigures:
     def test_figure_values_match_report(self, sample_reconciliation, sample_analytics):
         figures = _build_traced_figures(sample_reconciliation, sample_analytics)
         billed_fig = next(f for f in figures if f.source_field == "total_billed")
-        assert "3,260" in billed_fig.display_value
+        assert "3,190" in billed_fig.display_value
 
 
 class TestFallbackNarrative:
     def test_contains_key_figures(self, sample_reconciliation, sample_analytics):
         narrative = _generate_fallback_narrative(sample_reconciliation, sample_analytics)
-        assert "₹3,260" in narrative  # total billed
+        assert "₹3,190" in narrative  # total billed (net of discount)
         assert "18" in narrative  # visit count
         assert "cost data" in narrative.lower()  # profit disclaimer
 
@@ -116,6 +122,7 @@ class TestFallbackNarrative:
             date="2026-07-26",
             total_billed_paise=0,
             total_collected_paise=0,
+            total_discounts_paise=0,
             outstanding_paise=0,
             total_refunds_paise=0,
             total_visits=0,
@@ -137,6 +144,36 @@ class TestFallbackNarrative:
         assert "0 visits" in narrative
 
 
+class TestGroundingVerification:
+    """
+    Tests for the actual number-extraction grounding check — the part that
+    verifies what the LLM wrote, not just what the prompt asked for.
+    """
+
+    def test_narrative_using_only_given_figures_passes(self, sample_reconciliation, sample_analytics):
+        allowed = _build_grounding_values(sample_reconciliation, sample_analytics)
+        narrative = (
+            "Good evening! ₹3,190 billed across 18 visits, ₹3,172 collected (99%). "
+            "₹18 is still outstanding across 3 visits. Busiest hour: 1pm–2pm with "
+            "₹755 in revenue. Top mover: OMEPRAZOLE (18 units)."
+        )
+        assert _find_ungrounded_numbers(narrative, allowed) == []
+
+    def test_narrative_with_invented_number_is_flagged(self, sample_reconciliation, sample_analytics):
+        allowed = _build_grounding_values(sample_reconciliation, sample_analytics)
+        narrative = (
+            "Good evening! ₹3,190 billed across 18 visits, with an estimated "
+            "profit margin of 42%, which is a number nobody gave the model."
+        )
+        ungrounded = _find_ungrounded_numbers(narrative, allowed)
+        assert "42" in ungrounded
+
+    def test_generic_connector_numbers_are_not_flagged(self, sample_reconciliation, sample_analytics):
+        allowed = _build_grounding_values(sample_reconciliation, sample_analytics)
+        narrative = "There was 1 refund and 0 issues today."
+        assert _find_ungrounded_numbers(narrative, allowed) == []
+
+
 class TestPromptConstruction:
     def test_prompt_contains_grounding_rules(self, sample_reconciliation, sample_analytics):
         prompt = _build_prompt(sample_reconciliation, sample_analytics)
@@ -146,5 +183,5 @@ class TestPromptConstruction:
 
     def test_prompt_contains_figures(self, sample_reconciliation, sample_analytics):
         prompt = _build_prompt(sample_reconciliation, sample_analytics)
-        assert "₹3,260" in prompt
+        assert "₹3,190" in prompt
         assert "18 visits" in prompt

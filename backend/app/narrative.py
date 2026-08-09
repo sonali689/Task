@@ -15,6 +15,11 @@ import os
 import re
 from typing import Optional
 
+# Small connector numbers that appear in almost any sentence regardless of
+# the data ("a refund", "1pm") and carry no real hallucination signal on
+# their own.
+_IGNORED_TOKENS = {"0", "1"}
+
 from dotenv import load_dotenv
 
 from .models import (
@@ -200,6 +205,87 @@ def _build_traced_figures(
     return figures
 
 
+def _numeric_tokens(text: str) -> set[str]:
+    """
+    Extract every numeric token from a string, normalized to a comparable
+    canonical form: no thousands separators, no trailing ".00".
+    """
+    tokens: set[str] = set()
+    for raw in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        cleaned = raw.replace(",", "")
+        if "." in cleaned:
+            whole, frac = cleaned.split(".", 1)
+            if frac.strip("0") == "":
+                cleaned = whole
+        tokens.add(cleaned)
+    return tokens
+
+
+def _build_grounding_values(
+    reconciliation: ReconciliationReport,
+    analytics: AnalyticsReport,
+) -> set[str]:
+    """
+    The complete set of numbers the LLM was actually given (the same
+    figures used to build the prompt). Used to verify the generated
+    narrative doesn't contain a number that traces back to nothing.
+    """
+    values: set[str] = set()
+
+    def add_paise(paise: int) -> None:
+        rupees = paise / 100
+        values.add(str(paise))
+        values.add(str(int(rupees)) if rupees == int(rupees) else f"{rupees:.2f}")
+
+    add_paise(reconciliation.total_billed_paise)
+    add_paise(reconciliation.total_collected_paise)
+    add_paise(reconciliation.outstanding_paise)
+    add_paise(reconciliation.total_refunds_paise)
+
+    values.add(str(reconciliation.total_visits))
+    values.add(str(reconciliation.refund_count))
+    values.add(str(reconciliation.pending_visits))
+
+    if reconciliation.total_billed_paise > 0:
+        pct = round(
+            (reconciliation.total_collected_paise / reconciliation.total_billed_paise) * 100
+        )
+        values.add(str(pct))
+
+    if analytics.peak_hour:
+        add_paise(analytics.peak_hour.revenue_paise)
+        h = analytics.peak_hour.hour
+        for hour in (h, (h + 1) % 24):
+            values.add(str(hour))
+            display = hour % 12
+            display = 12 if display == 0 else display
+            values.add(str(display))
+
+    if analytics.top_drugs_by_qty:
+        values.add(str(analytics.top_drugs_by_qty[0].value))
+
+    if analytics.top_drugs_by_revenue:
+        add_paise(analytics.top_drugs_by_revenue[0].value)
+
+    # Narratives often restate the date — allow its components too.
+    try:
+        year, month, day = reconciliation.date.split("-")
+        values.update({year, str(int(month)), str(int(day))})
+    except ValueError:
+        pass
+
+    return values
+
+
+def _find_ungrounded_numbers(narrative: str, allowed: set[str]) -> list[str]:
+    """
+    Return any numeric token in the narrative that doesn't trace back to
+    an allowed figure — i.e. a candidate invented/hallucinated number.
+    """
+    found = _numeric_tokens(narrative)
+    return sorted(n for n in found if n not in allowed and n not in _IGNORED_TOKENS)
+
+
 async def generate_narrative(
     reconciliation: ReconciliationReport,
     analytics: AnalyticsReport,
@@ -230,6 +316,19 @@ async def generate_narrative(
         if len(narrative_text) < 20:
             error_message = "LLM returned a response that was too short to be useful."
             narrative_text = None
+        else:
+            # Grounding check: every number the LLM wrote must trace back
+            # to a figure we actually gave it. This is the enforcement
+            # step — the prompt instructions alone don't guarantee it.
+            allowed_values = _build_grounding_values(reconciliation, analytics)
+            ungrounded = _find_ungrounded_numbers(narrative_text, allowed_values)
+            if ungrounded:
+                error_message = (
+                    "LLM response contained number(s) not found in the "
+                    f"deterministic report ({', '.join(ungrounded)}) — "
+                    "discarded to avoid showing an unverified figure."
+                )
+                narrative_text = None
 
     # Fallback to template if LLM failed
     if not narrative_text:

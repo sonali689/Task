@@ -91,16 +91,23 @@ class PaymentModeBreakdown(BaseModel):
 
 
 class ReconciliationReport(BaseModel):
-    """End-of-day reconciliation report — all values in paise."""
+    """End-of-day reconciliation report — all values in paise.
+
+    total_billed_paise is net of any discount (i.e. the amount actually
+    invoiced to the patient), so outstanding_paise never counts a discount
+    as money still owed. total_discounts_paise is broken out separately
+    for transparency.
+    """
     clinic_id: str
     date: str
     total_billed_paise: int
     total_collected_paise: int
+    total_discounts_paise: int
     outstanding_paise: int
     total_refunds_paise: int
     total_visits: int
     refund_count: int
-    pending_visits: int  # visits where amount_paid < billed
+    pending_visits: int  # visits where amount_paid < net billed (after discount)
     payment_mode_breakdown: list[PaymentModeBreakdown]
     validation_errors: list[RowValidationError]
 
