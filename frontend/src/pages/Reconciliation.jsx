@@ -5,8 +5,9 @@ import PaymentTable from '../components/PaymentTable'
 
 /**
  * Screen 1: EOD Reconciliation Dashboard
- * Matches the assignment screenshot exactly:
+ * Matches the assignment screenshot:
  * - 4 stat cards: Total Billed, Total Collected, Outstanding, Refunds
+ * - Discounts shown as a supplementary badge
  * - Payment Mode Breakdown table
  */
 export default function Reconciliation({ clinicId, date }) {
@@ -105,6 +106,16 @@ export default function Reconciliation({ clinicId, date }) {
           variant="refunds"
         />
       </div>
+
+      {/* Show discounts if any were applied */}
+      {report.total_discounts_paise > 0 && (
+        <div className="discount-note" id="discount-note">
+          💰 <strong>{formatRupees(report.total_discounts_paise)}</strong> in discounts applied today
+          <span className="discount-detail">
+            — billed amount shown is net of discounts (after subtracting discount from line-item totals)
+          </span>
+        </div>
+      )}
 
       <PaymentTable breakdown={report.payment_mode_breakdown} />
 
