@@ -4,7 +4,7 @@
  * All endpoints are proxied through Vite dev server (/api → localhost:8000).
  */
 
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
 /**
  * Upload a billing log JSON file.
