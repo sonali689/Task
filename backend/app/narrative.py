@@ -270,9 +270,14 @@ def _build_grounding_values(
     # Narratives often restate the date — allow its components too.
     try:
         year, month, day = reconciliation.date.split("-")
-        values.update({year, str(int(month)), str(int(day))})
+        values.update({year, month, day, str(int(month)), str(int(day))})
     except ValueError:
         pass
+
+    # Narratives are given the clinic_id as context and may restate it
+    # (e.g. "CLN-KNP-014") — its numeric substrings aren't invented figures,
+    # so allow them explicitly rather than flagging them.
+    values.update(_numeric_tokens(reconciliation.clinic_id))
 
     return values
 
@@ -378,7 +383,7 @@ async def _call_gemini(prompt: str) -> str:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-flash-latest")
     response = model.generate_content(prompt)
     return response.text
 

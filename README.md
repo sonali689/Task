@@ -1,9 +1,9 @@
 # SwasthiQ — EOD Billing & Analytics Agent
 
 A full-stack application that ingests daily clinic billing logs and produces:
-1. **Deterministic EOD Reconciliation** — total billed, collected, outstanding, refunds (split by payment mode)
+1. **Deterministic EOD Reconciliation** — total billed, collected, outstanding, discounts, and refunds (split by payment mode)
 2. **Analytics Dashboard** — revenue by hour-of-day, top medicines by quantity and revenue
-3. **AI Narrative Summary** — LLM-generated WhatsApp-friendly summary where every figure is traced back to its source in the deterministic report
+3. **AI Narrative Summary** — LLM-generated WhatsApp-friendly summary where every figure is verified against the deterministic report before being shown
 
 > Built for the SwasthiQ hiring assignment — Kaagazy Technologies Private Limited.
 
@@ -15,8 +15,8 @@ A full-stack application that ingests daily clinic billing logs and produces:
 |---|---|
 | **Backend** | Python 3.11+, FastAPI, Pydantic v2, SQLite (WAL mode) |
 | **Frontend** | React 18, Vite, Recharts, React Router v6 |
-| **LLM** | Google Gemini 1.5 Flash (default), OpenAI, or Anthropic (configurable) |
-| **Tests** | pytest — 58 tests covering all 3 dataset days + edge cases |
+| **LLM** | Google Gemini (`gemini-flash-latest`, default), OpenAI, or Anthropic (configurable) |
+| **Tests** | pytest — 69 tests covering all 3 dataset days, discount handling, and LLM grounding |
 
 ---
 
@@ -36,12 +36,12 @@ A full-stack application that ingests daily clinic billing logs and produces:
 │  Analytics      │ ◄──────────────────►│  │ (deterministic)│ │ (deterministic)│
 │                 │                     │  └──────────────┘  └──────────────┘  │
 │  Screen 3:      │  POST /narrative    │  ┌──────────────────────────────────┐│
-│  Narrative      │ ◄──────────────────►│  │  Narrative (LLM + figure tracing)││
+│  Narrative      │ ◄──────────────────►│  │  Narrative (LLM + grounding check)││
 │                 │                     │  └──────────────────────────────────┘│
 └─────────────────┘                     └──────────────────────────────────────┘
 ```
 
-**Data flow**: Upload → Validate → Store → Compute (reconciliation + analytics) → Cache → Serve via API → Render in React UI → LLM narrative generated on demand from cached deterministic data.
+**Data flow**: Upload → Validate → Store → Compute (reconciliation + analytics) → Cache → Serve via API → Render in React UI → LLM narrative generated on demand from cached deterministic data, verified before being returned.
 
 ---
 
@@ -87,28 +87,30 @@ Returns the deterministic EOD reconciliation report. All values in integer **pai
 {
   "clinic_id": "CLN-KNP-014",
   "date": "2026-07-27",
-  "total_billed_paise": 326000,
+  "total_billed_paise": 319000,
   "total_collected_paise": 317200,
-  "outstanding_paise": 8800,
+  "total_discounts_paise": 7000,
+  "outstanding_paise": 1800,
   "total_refunds_paise": 0,
   "total_visits": 18,
   "refund_count": 0,
   "pending_visits": 3,
   "payment_mode_breakdown": [
-    { "mode": "cash", "billed_paise": 129000, "collected_paise": 127000, "outstanding_paise": 2000 },
-    { "mode": "card", "billed_paise": 107000, "collected_paise": 79700, "outstanding_paise": 27300 },
-    { "mode": "upi",  "billed_paise": 90000,  "collected_paise": 110500, "outstanding_paise": -20500 }
+    { "mode": "cash", "billed_paise": 127500, "collected_paise": 127000, "outstanding_paise": 500 },
+    { "mode": "card", "billed_paise": 83500,  "collected_paise": 82700,  "outstanding_paise": 800 },
+    { "mode": "upi",  "billed_paise": 108000, "collected_paise": 107500, "outstanding_paise": 500 }
   ],
   "validation_errors": []
 }
 ```
 
 **Reconciliation definitions**:
-- **Total Billed** = Σ (qty × unit_price_paise) across all line_items, for non-refund visits only
+- **Total Billed** = Σ (line_items total − discount_paise) across non-refund visits — the amount actually invoiced to the patient, net of any discount
 - **Total Collected** = Σ amount_paid_paise for non-refund visits only
-- **Outstanding** = Total Billed − Total Collected
+- **Total Discounts** = Σ discount_paise for non-refund visits — tracked separately for transparency; a discount is money the clinic chose not to charge, so it is never counted as outstanding
+- **Outstanding** = Total Billed − Total Collected (a discount is already netted out of Total Billed, so it can never appear here)
 - **Refunds** = Σ |amount_paid_paise| for refund rows (always displayed as positive)
-- **Pending Visits** = count of non-refund visits where amount_paid < billed
+- **Pending Visits** = count of non-refund visits where amount_paid < net billed (i.e. a genuine shortfall beyond any discount)
 
 ---
 
@@ -150,21 +152,21 @@ Returns the deterministic analytics report. Only non-refund records are included
 
 ### 4. `POST /api/billing/{clinic_id}/{date}/narrative`
 
-Generate an LLM narrative summary from the deterministic report. Every figure is traced.
+Generate an LLM narrative summary from the deterministic report. Every number in the response is checked against the report before being returned.
 
 **Response** (`200 OK`):
 ```json
 {
   "clinic_id": "CLN-KNP-014",
   "date": "2026-07-27",
-  "narrative": "Good evening! Here's today's summary for Mehta Clinic (2026-07-27):\n\n₹3,260 billed across 18 visits, ₹3,172 collected (97%).\n₹88 is still outstanding across 3 visits...",
+  "narrative": "Good evening! Here's today's summary for Mehta Clinic (2026-07-27):\n\n₹3,190 billed across 18 visits, ₹3,172 collected (99%).\n₹18 is still outstanding across 3 visits...",
   "traced_figures": [
-    { "display_value": "₹3,260",       "source_field": "total_billed",       "source_label": "total_billed" },
-    { "display_value": "₹3,172",       "source_field": "total_collected",    "source_label": "total_collected" },
-    { "display_value": "₹88",          "source_field": "outstanding",        "source_label": "outstanding" },
-    { "display_value": "₹0",           "source_field": "refunds",            "source_label": "refunds" },
+    { "display_value": "₹3,190",        "source_field": "total_billed",        "source_label": "total_billed" },
+    { "display_value": "₹3,172",        "source_field": "total_collected",     "source_label": "total_collected" },
+    { "display_value": "₹18",           "source_field": "outstanding",         "source_label": "outstanding" },
+    { "display_value": "₹0",            "source_field": "refunds",             "source_label": "refunds" },
     { "display_value": "1pm–2pm / ₹755", "source_field": "revenue_by_hour[max]", "source_label": "revenue_by_hour[max]" },
-    { "display_value": "OMEPRAZOLE / 18",     "source_field": "top_drug_by_qty",     "source_label": "top_drug_by_qty" },
+    { "display_value": "OMEPRAZOLE / 18",       "source_field": "top_drug_by_qty",     "source_label": "top_drug_by_qty" },
     { "display_value": "ATORVASTATIN / ₹1,200", "source_field": "top_drug_by_revenue", "source_label": "top_drug_by_revenue" }
   ],
   "status": "success",
@@ -172,7 +174,9 @@ Generate an LLM narrative summary from the deterministic report. Every figure is
 }
 ```
 
-`status` can be `"success"` (LLM worked), `"fallback"` (used deterministic template), or `"error"`.
+`status` is `"success"` (LLM output passed the grounding check), `"fallback"` (deterministic template used instead — either the LLM was unavailable or its output failed grounding), or `"error"`.
+
+*Note: `total_discounts_paise` is available on the reconciliation report but is not currently surfaced as its own traced figure — it isn't referenced in the narrative prompt or template.*
 
 ---
 
@@ -210,6 +214,7 @@ These modules are **pure functions** that take validated records and return comp
 - **Never call an LLM** — they are the ground truth
 - Use only simple arithmetic: sums, counts, max, sorting
 - Are the single source of truth for all figures shown in the UI
+- Compute "billed" net of any discount, so a discount can never be misread as unpaid/outstanding revenue
 
 ### 4. Atomic Storage (`database.py`)
 
@@ -219,12 +224,13 @@ These modules are **pure functions** that take validated records and return comp
 
 ### 5. LLM Grounding (`narrative.py`)
 
-The LLM never sees raw billing data. Instead:
-- The prompt provides **only pre-computed figures** from the deterministic report
-- The prompt explicitly instructs: *"Use ONLY the figures provided. Do NOT invent, approximate, or calculate."*
-- The `traced_figures` array maps every key number back to its source field (e.g., `"₹3,260"` → `total_billed`)
-- If the LLM is unavailable or returns garbage (< 20 chars), a **deterministic template-based fallback** is used automatically
-- The narrative page shows traced figures alongside the text for manual verification
+The LLM never sees raw billing data, and its output is never trusted blindly:
+
+- The prompt provides **only pre-computed figures** from the deterministic report, plus an explicit instruction: *"Use ONLY the figures provided. Do NOT invent, approximate, or calculate."*
+- After generation, every numeric token in the LLM's response is extracted and checked against the exact set of figures it was given (monetary amounts, visit/refund/pending counts, the collection percentage, peak-hour revenue, top-drug values, and the clinic ID / date, since those may legitimately be restated). Any number that doesn't match anything in that set is treated as a possible hallucination.
+- If the check fails — or the LLM is unavailable, errors out, or returns a response under 20 characters — the request automatically falls back to a **deterministic template-based narrative** built directly from the report, and `error_message` explains why.
+- The `traced_figures` array separately maps each key report field to its display value, shown alongside the narrative for manual verification.
+- This is enforced in code (`_build_grounding_values` / `_find_ungrounded_numbers` in `narrative.py`), not left to the prompt instructions alone.
 
 ### 6. Idempotent Re-computation
 
@@ -241,10 +247,10 @@ The assignment includes intentional edge cases. Here's each one and how it's han
 | 1 | **Empty day** — no transactions | `billing_log_2026-07-26.json` | `[]` | All-zero report created, no crash, no division-by-zero |
 | 2 | **Refund-only day** — no sales | `billing_log_2026-07-25.json` | All 3 records | `total_billed = 0`, `total_collected = 0`, correct `refunds = ₹490`, analytics shows no data |
 | 3 | **Missing required field** (`payment_mode`) | `billing_log_2026-07-27.json` | V-019 | Row rejected with `"field 'payment_mode' — Field required."`, other 18 rows processed normally |
-| 4 | **Drug name typo** ("PARACETMOL") | `billing_log_2026-07-27.json` | V-009 | Accepted as-is — valid schema-wise. Appears as separate drug in rankings. System ingests what it receives; fuzzy matching would risk silent data corruption |
-| 5 | **Amount paid ≠ line items total** | `billing_log_2026-07-27.json` | V-004, V-016, etc. | Both tracked independently: `billed` = line_items sum, `collected` = amount_paid. Difference captured as `outstanding`. Reflects real-world discounts, negotiation, partial payments |
-| 6 | **Negative amounts on refunds** | `billing_log_2026-07-25.json` | All records | Validator enforces: `is_refund=true` ⟹ `amount_paid_paise < 0`. Reconciliation uses `abs()` for display. A refund with positive amount is **rejected** |
-| 7 | **Discounts applied** | `billing_log_2026-07-27.json` | V-002, V-003, V-006, etc. | `discount_paise` is stored for audit but doesn't enter reconciliation formula — `outstanding = billed - collected` naturally captures the gap |
+| 4 | **Drug name typo** ("PARACETMOL") | `billing_log_2026-07-27.json` | V-009 | Accepted as-is — valid schema-wise. Appears as a separate entry in rankings. System ingests what it receives; fuzzy-matching drug names would risk silently merging distinct data |
+| 5 | **Amount paid less than billed, beyond any discount** | `billing_log_2026-07-27.json` | V-004, V-011, V-016 | Tracked as genuine outstanding: `net billed (line_items − discount)` minus `amount_paid`. Only these three visits have a real shortfall once discounts are excluded |
+| 6 | **Negative amounts on refunds** | `billing_log_2026-07-25.json` | All records | Validator enforces: `is_refund=true` ⟹ `amount_paid_paise < 0`. Reconciliation uses `abs()` for display. A refund with a positive amount is **rejected** |
+| 7 | **Discounts applied** | `billing_log_2026-07-27.json` | V-002, V-003, V-006, etc. | `discount_paise` is subtracted from the gross line-item total to get `total_billed`, and tracked separately as `total_discounts_paise`. A discount is never counted as outstanding — only a genuine shortfall beyond the discount is |
 
 ---
 
@@ -264,10 +270,12 @@ source venv/bin/activate
 
 pip install -r requirements.txt
 cp .env.example .env    # Then set your GEMINI_API_KEY
-python -m uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --reload-dir app --port 8000
 ```
 
 The API will be available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+
+*(`--reload-dir app` scopes hot-reload to the app code only, so editing test files doesn't trigger an unrelated server restart.)*
 
 ### Frontend
 
@@ -286,11 +294,11 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-All 58 tests should pass:
-- `test_validator.py` — 10 tests (JSON parsing, schema validation, error cases)
-- `test_reconciliation.py` — 14 tests (Jul 27 busy day, Jul 25 refund-only, Jul 26 empty)
+All 69 tests should pass:
+- `test_validator.py` — 14 tests (JSON parsing, schema validation, error cases)
+- `test_reconciliation.py` — 25 tests (Jul 27 busy day, Jul 25 refund-only, Jul 26 empty, discount-vs-outstanding handling)
 - `test_analytics.py` — 16 tests (revenue by hour, drug rankings, edge cases)
-- `test_narrative.py` — 10 tests (figure tracing, fallback narrative, prompt construction)
+- `test_narrative.py` — 14 tests (figure tracing, fallback narrative, prompt construction, LLM output grounding verification)
 
 ---
 
@@ -304,7 +312,7 @@ All 58 tests should pass:
 │   ├── validator.py         # Input validation — row-level errors, never crashes
 │   ├── reconciliation.py    # Deterministic reconciliation — never calls LLM
 │   ├── analytics.py         # Deterministic analytics — never calls LLM
-│   ├── narrative.py         # LLM narrative + figure tracing + fallback
+│   ├── narrative.py         # LLM narrative + grounding verification + fallback
 │   └── database.py          # SQLite storage — atomic upserts, WAL mode
 ├── tests/
 │   ├── test_validator.py
@@ -347,8 +355,14 @@ The narrative endpoint supports three LLM providers. Set `LLM_PROVIDER` in `.env
 
 | Provider | Env Var | Default Model |
 |---|---|---|
-| Google Gemini *(default)* | `GEMINI_API_KEY` | `gemini-1.5-flash` |
+| Google Gemini *(default)* | `GEMINI_API_KEY` | `gemini-flash-latest` |
 | OpenAI | `OPENAI_API_KEY` | `gpt-3.5-turbo` |
-| Anthropic | `ANTHROPIC_API_KEY` | `claude-3-haiku` |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-3-haiku-20240307` |
 
-If no API key is configured, the system uses a **deterministic template-based fallback** that produces the same narrative from the same data every time.
+If no API key is configured, or the LLM's response fails the grounding check described above, the system uses a **deterministic template-based fallback** that produces the same narrative from the same data every time.
+
+---
+
+## Live Deployment
+
+*TODO: add the hosted Vercel/Netlify link here before submitting — this is a required part of the submission.*

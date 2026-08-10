@@ -168,8 +168,26 @@ class TestGroundingVerification:
         ungrounded = _find_ungrounded_numbers(narrative, allowed)
         assert "42" in ungrounded
 
-    def test_generic_connector_numbers_are_not_flagged(self, sample_reconciliation, sample_analytics):
+    def test_restated_clinic_id_is_not_flagged(self, sample_reconciliation, sample_analytics):
+        """
+        The prompt gives the LLM the clinic_id as context (e.g. "Clinic
+        CLN-KNP-014"), so the model may legitimately restate it. Its
+        numeric substring ("014") is an identifier, not an invented figure.
+        """
         allowed = _build_grounding_values(sample_reconciliation, sample_analytics)
+        narrative = "Summary for Clinic CLN-KNP-014: ₹3,190 billed across 18 visits."
+        assert _find_ungrounded_numbers(narrative, allowed) == []
+
+    def test_zero_padded_date_is_not_flagged(self, sample_reconciliation, sample_analytics):
+        """
+        Narratives often restate the literal date string (e.g. "2026-07-27"),
+        whose zero-padded month/day ("07") must be allowed even though the
+        report's `date` field splits it out differently internally.
+        """
+        allowed = _build_grounding_values(sample_reconciliation, sample_analytics)
+        narrative = "Summary for 2026-07-27: ₹3,190 billed across 18 visits."
+        assert _find_ungrounded_numbers(narrative, allowed) == []
+
         narrative = "There was 1 refund and 0 issues today."
         assert _find_ungrounded_numbers(narrative, allowed) == []
 
