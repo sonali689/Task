@@ -361,8 +361,4 @@ The narrative endpoint supports three LLM providers. Set `LLM_PROVIDER` in `.env
 
 If no API key is configured, or the LLM's response fails the grounding check described above, the system uses a **deterministic template-based fallback** that produces the same narrative from the same data every time.
 
----
-
-## Live Deployment
-
-*TODO: add the hosted Vercel/Netlify link here before submitting — this is a required part of the submission.*
+--
